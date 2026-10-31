@@ -57,12 +57,14 @@ keep = 1                     # other releases kept by updates, besides the one i
 bind = "127.0.0.1:8130"      # the web panel: this computer only, or a tailnet address (100.x); "" turns it off
 allow_public = false         # true lets bind be any address; never put the panel on the open internet
 
-# Horizon's anticheat (docs/anticheat.md) is off: the server checks only what vanilla's checks. To turn it on:
+# Horizon's anticheat (docs/anticheat.md) is on: `combat` drops and kicks attacks no vanilla client sends;
+# timer, ground and prediction only write logs/anticheat.log until they're trusted. To change it:
 # [anticheat]
-# enabled = true
+# enabled = true             # false: the server checks only what vanilla's checks
 # alerts = true              # tell online operators (alert_level = 2) in their chat; the console always is
 # log = "logs/anticheat.log" # every flag, one line each
 # [anticheat.timer]          # a sped-up game: more client ticks than the server's clock allows
+# enabled = true             # false turns this check off
 # setback = 2                # the violation level from which the player is sent back; 0: never
 # alert = 5
 # kick = 20
@@ -105,12 +107,12 @@ pub struct Config {
     pub updates: Updates,
     #[serde(default)]
     pub panel: Panel,
-    /// The game reads this section itself (docs/anticheat.md); written only when it isn't the default (off).
-    #[serde(default, skip_serializing_if = "anticheat_off")]
+    /// The game reads this section itself (docs/anticheat.md); written only when it isn't the default.
+    #[serde(default, skip_serializing_if = "anticheat_default")]
     pub anticheat: horizon_anticheat::Config,
 }
 
-fn anticheat_off(c: &horizon_anticheat::Config) -> bool {
+fn anticheat_default(c: &horizon_anticheat::Config) -> bool {
     *c == horizon_anticheat::Config::default()
 }
 
@@ -572,14 +574,17 @@ mod tests {
     }
 
     #[test]
-    fn anticheat_is_off_unless_its_section_turns_it_on() {
-        assert!(!Config::default().anticheat.enabled);
+    fn anticheat_is_on_unless_its_section_turns_it_off() {
+        assert!(Config::default().anticheat.enabled);
         assert!(!TEMPLATE.lines().any(|l| l.trim() == "[anticheat]"));
         let text =
-            format!("{TEMPLATE}\n[anticheat]\nenabled = true\n[anticheat.timer]\nkick = 0\n");
+            format!("{TEMPLATE}\n[anticheat]\nenabled = true\n[anticheat.timer]\nkick = 20\n");
         let c = Config::parse(&text).unwrap();
         assert!(c.anticheat.enabled);
-        assert_eq!(c.anticheat.timer.kick, 0.0);
+        assert_eq!(c.anticheat.timer.kick, 20.0);
+        let off = Config::parse(&format!("{TEMPLATE}\n[anticheat]\nenabled = false\n")).unwrap();
+        assert!(!off.anticheat.enabled);
+        assert_eq!(Config::parse(&render(&off)).unwrap(), off);
         // The game reads the same section from the same file.
         assert_eq!(
             horizon_anticheat::Config::from_server_toml(&text).unwrap(),
