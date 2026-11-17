@@ -4425,6 +4425,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::failed_removal_is_incomplete_and_can_be_retried"
                 ])
@@ -4743,6 +4744,7 @@ pub fn {f}("
             let home = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::native_resources_resolve_to_the_base_and_prevent_its_removal",
                     "--nocapture"
