@@ -300,7 +300,7 @@ pub fn migrate_current_with_prepare(
     let bootstrap = bootstrap_path()?;
     let deadline = Instant::now() + Duration::from_secs(10);
     let lease = loop {
-        match lock_at(&bootstrap, true) {
+        match MigrationLease::take(&bootstrap) {
             Ok(lease) => break lease,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(e),
@@ -328,8 +328,26 @@ pub fn migrate_with_prepare(
     progress: impl FnMut(&str),
     prepare: impl FnOnce(&Roots, &Roots) -> Result<()>,
 ) -> Result<Roots> {
-    let lease = lock_at(bootstrap, true)?;
+    let lease = MigrationLease::take(bootstrap)?;
     migrate_locked(source, target, bootstrap, progress, prepare, &lease)
+}
+
+/// A migration's exclusive lock, released before its file closes. A child process spawned while
+/// it is held, by any thread, has a copy of the descriptor until its exec, and closing ours alone
+/// would leave the lock taken through that copy: the next migration would read "Cannot lock"
+/// (#18138). `horizon_platform::mod_package::locks::Locked` releases its locks the same way.
+struct MigrationLease(File);
+
+impl MigrationLease {
+    fn take(bootstrap: &Path) -> Result<Self> {
+        lock_at(bootstrap, true).map(Self)
+    }
+}
+
+impl Drop for MigrationLease {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 fn migrate_locked(
@@ -338,8 +356,10 @@ fn migrate_locked(
     bootstrap: &Path,
     mut progress: impl FnMut(&str),
     prepare: impl FnOnce(&Roots, &Roots) -> Result<()>,
-    _lease: &File,
+    _lease: &MigrationLease,
 ) -> Result<Roots> {
+    // How the launcher spelled its folder, which the links it made may name.
+    let written = source.launcher.clone();
     let source = validate_roots(source)?;
     if let Some(current) = resolve_at(bootstrap)? {
         if current != source {
@@ -376,20 +396,59 @@ fn migrate_locked(
             target.display()
         ));
     }
-    let destination = layout(&source, &target);
-    tool_safe(&destination.build)?;
-    fs::create_dir_all(&target).map_err(|e| problem(&target, e))?;
+    let mut destination = layout(&source, &target);
+    // MinGW needs the *physical* path to be ASCII: aliases are canonicalized by rustc.
+    // Reserve a fresh sibling, never reuse or modify another location's build data.
+    let separate_build = tool_safe(&destination.build).is_err();
+    if separate_build {
+        destination.build = reserve_build_folder(&source, &target, bootstrap)?;
+    }
     let stage = target.join(".relocation-staging");
-    let staged = layout(&source, &stage);
+    let mut staged = layout(&source, &stage);
+    if separate_build {
+        // This unique folder is not published until the location pointer commits. It need
+        // not be renamed across volumes, and preparation sees its final, tool-safe path.
+        staged.build = destination.build.clone();
+    }
     let result = (|| {
+        fs::create_dir_all(&target).map_err(|e| problem(&target, e))?;
         private_dir(&stage)?;
         progress("Copying and verifying launcher data");
-        copy_tree(&source.launcher, &staged.launcher, bootstrap, &mut progress)?;
+        // Preparing links other launchers' files into the launcher's data and links them again
+        // each time; they are never followed or copied. The server runtime's links are made
+        // again below, to the same release.
+        let runtime = crate::servers::RuntimeLinks::find(&source.launcher, &written)?;
+        let mut skip = runtime.paths(&source.launcher);
+        skip.extend(crate::sources::linked_layout_links(&source.launcher));
+        copy_tree(
+            &source.launcher,
+            &source.launcher,
+            &staged.launcher,
+            bootstrap,
+            &skip,
+            &mut progress,
+        )?;
         progress("Copying and verifying game data");
-        copy_tree(&source.game, &staged.game, bootstrap, &mut progress)?;
-        if !within(&source.build, &source.launcher) {
+        // Every instance's cache holds links the game made, which copy_tree refuses; the
+        // game rebuilds the cache on its next start.
+        copy_tree(
+            &source.game,
+            &source.game,
+            &staged.game,
+            bootstrap,
+            &crate::instances::game_caches(&source.game),
+            &mut progress,
+        )?;
+        if separate_build || !within(&source.build, &source.launcher) {
             progress("Copying and verifying build data");
-            copy_tree(&source.build, &staged.build, bootstrap, &mut progress)?;
+            copy_tree(
+                &source.build,
+                &source.build,
+                &staged.build,
+                bootstrap,
+                &[],
+                &mut progress,
+            )?;
         } else if !staged.build.exists() {
             fs::create_dir_all(&staged.build).map_err(|e| problem(&staged.build, e))?;
         }
@@ -401,12 +460,57 @@ fn migrate_locked(
             }
         }
         fs::remove_dir(&stage).map_err(|e| problem(&stage, e))?;
+        runtime.make(&destination.launcher)?;
         sync_dir(&target)?;
         progress("Committing data location");
         commit(bootstrap, &destination)?;
-        Ok(destination)
+        Ok(destination.clone())
     })();
-    result.map_err(|e: String| format!("{e}. Original data was kept. Partial copies may remain in {}; choose an empty folder to retry", target.display()))
+    result.map_err(|e: String| {
+        crate::i18n::trf(
+            "{error}. Original data was kept. Partial copies may remain in {target} and {build}; choose an empty folder to retry",
+            &[("error", &e), ("target", &target.display().to_string()), ("build", &destination.build.display().to_string())],
+        )
+    })
+}
+
+/// Prefer the chosen drive's nearest existing ASCII ancestor. If it is not writable
+/// (or a UNC share itself is non-ASCII), try alongside the existing build data. No
+/// environment lookup: explicit migration fixtures never reach the real user profile.
+fn reserve_build_folder(source: &Roots, target: &Path, bootstrap: &Path) -> Result<PathBuf> {
+    for parent in target
+        .ancestors()
+        .skip(1)
+        .chain(source.build.ancestors().skip(1))
+    {
+        let Ok(parent) = checked_path(parent) else {
+            continue;
+        };
+        if !parent.is_dir()
+            || tool_safe(&parent).is_err()
+            || [&source.launcher, &source.game, &source.build]
+                .iter()
+                .any(|root| within(&parent, root))
+        {
+            continue;
+        }
+        let Ok(folder) = tempfile::Builder::new()
+            .prefix("horizon-build-")
+            .tempdir_in(&parent)
+        else {
+            continue;
+        };
+        let real = checked_path(folder.path())?;
+        tool_safe(&real)?;
+        if overlaps(&real, &pointer_path(bootstrap)?) || overlaps(&real, target) {
+            continue;
+        }
+        // Keep partial copies just as the main destination does: after a failed commit
+        // no pointer names this folder, and the error tells the player where it remains.
+        let _ = folder.keep();
+        return Ok(real.join("build"));
+    }
+    Err(crate::i18n::tr("Could not create a Windows-compatible build folder. Choose a destination with a writable parent folder whose full path contains only ASCII characters and no spaces.").into())
 }
 
 fn layout(source: &Roots, target: &Path) -> Roots {
@@ -548,7 +652,37 @@ fn pointer_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn reject_link(path: &Path, meta: &fs::Metadata) -> Result<()> {
+/// The target of the symlink at `path` when the same link at the destination points into the
+/// copy: relative, only `..` then plain names, and lexically inside `root` from the link's folder.
+/// The link is read, never followed.
+#[cfg(unix)]
+fn contained_link(
+    root: &Path,
+    path: &Path,
+    meta: &fs::Metadata,
+) -> std::io::Result<Option<PathBuf>> {
+    if !meta.file_type().is_symlink() {
+        return Ok(None);
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let target = fs::read_link(path)?;
+    let (mut up, mut down) = (0, 0);
+    // Split by hand: `Path::components` would drop an interior `.` and repeated slashes.
+    for part in target.as_os_str().as_bytes().split(|&byte| byte == b'/') {
+        match part {
+            b".." if down == 0 => up += 1,
+            b"" | b"." | b".." => return Ok(None),
+            _ => down += 1,
+        }
+    }
+    let depth = path
+        .parent()
+        .and_then(|folder| folder.strip_prefix(root).ok())
+        .map(|folder| folder.components().count());
+    Ok((down > 0 && depth.is_some_and(|depth| up <= depth)).then_some(target))
+}
+
+pub(crate) fn reject_link(path: &Path, meta: &fs::Metadata) -> Result<()> {
     #[cfg(windows)]
     let reparse = {
         use std::os::windows::fs::MetadataExt;
@@ -571,10 +705,10 @@ fn tool_safe(path: &Path) -> Result<()> {
             .to_str()
             .is_some_and(|s| s.is_ascii() && !s.bytes().any(|b| b.is_ascii_whitespace()))
     {
-        return Err(
-            "Choose a destination with only ASCII characters and no spaces for Windows build tools"
-                .into(),
-        );
+        return Err(crate::i18n::trf(
+            "Windows build tools cannot use the build folder \"{path}\" because its full path contains spaces, other whitespace, or non-ASCII characters. Choose an empty destination whose full path uses English letters, numbers, underscores or hyphens, for example D:\\Horizon_Data. Check every parent folder too.",
+            &[("path", &path.display().to_string())],
+        ));
     }
     Ok(())
 }
@@ -602,10 +736,14 @@ fn new_file(path: &Path) -> Result<File> {
     options.open(path).map_err(|e| problem(path, e))
 }
 
+/// Copies `source`, inside `root`, to `dest`, leaving out the paths in `skip`.
+#[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))]
 fn copy_tree(
+    root: &Path,
     source: &Path,
     dest: &Path,
     bootstrap: &Path,
+    skip: &[PathBuf],
     progress: &mut impl FnMut(&str),
 ) -> Result<()> {
     let meta = match fs::symlink_metadata(source) {
@@ -613,6 +751,10 @@ fn copy_tree(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return private_dir(dest),
         Err(e) => return Err(problem(source, e)),
     };
+    #[cfg(unix)]
+    if let Some(target) = contained_link(root, source, &meta).map_err(|e| problem(source, e))? {
+        return std::os::unix::fs::symlink(&target, dest).map_err(|e| problem(dest, e));
+    }
     reject_link(source, &meta)?;
     if meta.is_dir() {
         private_dir(dest)?;
@@ -620,6 +762,9 @@ fn copy_tree(
         for entry in fs::read_dir(source).map_err(|e| problem(source, e))? {
             let entry = entry.map_err(|e| problem(source, e))?;
             let path = entry.path();
+            if skip.contains(&path) {
+                continue;
+            }
             let controls = [
                 bootstrap.to_path_buf(),
                 bootstrap.with_file_name("migration.lock"),
@@ -631,7 +776,14 @@ fn copy_tree(
             {
                 continue;
             }
-            copy_tree(&path, &dest.join(entry.file_name()), bootstrap, progress)?;
+            copy_tree(
+                root,
+                &path,
+                &dest.join(entry.file_name()),
+                bootstrap,
+                skip,
+                progress,
+            )?;
         }
         fs::set_permissions(dest, meta.permissions()).map_err(|e| problem(dest, e))?;
         sync_dir(dest)?;
@@ -705,7 +857,7 @@ fn commit(bootstrap: &Path, roots: &Roots) -> Result<()> {
     Ok(())
 }
 
-fn sync_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         File::open(path)

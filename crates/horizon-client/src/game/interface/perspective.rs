@@ -404,7 +404,10 @@ impl Game<'_> {
         let (yaw, pitch) = self
             .posed_rotation
             .unwrap_or((self.view.y_rot, self.view.x_rot));
-        super::camera_rotation(CameraType::FirstPerson, yaw, pitch)
+        super::rolled_camera(
+            super::camera_rotation(CameraType::FirstPerson, yaw, pitch),
+            self.posed_roll,
+        )
     }
     /// The player as `Camera.alignWithEntity` sees it.
     fn player_camera_entity(&mut self) -> Option<CameraEntity> {
@@ -757,7 +760,7 @@ impl Game<'_> {
     pub(super) fn player_model_shown(&self) -> bool {
         (self.own_body_in_view()
             || shadow_pass_takes_own_model(
-                self.pack_shadow_casters.1,
+                self.occlusion.shadow_casters.1,
                 self.pack_ids.is_some(),
                 self.spectator(),
             ))
